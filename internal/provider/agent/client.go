@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	timeout           = 30 * time.Second
+	timeout           = 90 * time.Second
 	zeroesWipeTimeout = 24 * time.Hour
 )
 
