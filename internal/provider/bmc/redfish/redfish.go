@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/siderolabs/gen/xslices"
@@ -106,7 +107,14 @@ func (c *Client) SetPXEBootOnce(ctx context.Context, mode pxe.BootMode) error {
 			}
 		}
 
-		return system.SetBoot(boot)
+		err = system.SetBoot(boot)
+		if err != nil && c.isAMIFutureStateError(err) {
+			c.logger.Debug("attempting AMI FutureState workaround for boot settings")
+
+			return c.setBootAMIFutureState(client, system, boot)
+		}
+
+		return err
 	})
 }
 
@@ -143,6 +151,60 @@ func (c *Client) getSystem(client *gofish.APIClient) (*redfish.ComputerSystem, e
 	}
 
 	return systems[0], nil
+}
+
+// isAMIFutureStateError checks if the error is the specific AMI error requiring FutureState URI.
+func (c *Client) isAMIFutureStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := err.Error()
+
+	return strings.Contains(errMsg, "Ami.1.0.OperationSupportedInFutureStateURI")
+}
+
+// setBootAMIFutureState handles boot setting for AMI BMCs using the FutureState URI.
+func (c *Client) setBootAMIFutureState(client *gofish.APIClient, system *redfish.ComputerSystem, boot redfish.Boot) error {
+	// For AMI BMCs, we need to:
+	// 1. GET the current FutureState to obtain ETag
+	// 2. PATCH boot settings to /redfish/v1/Systems/{id}/SD (FutureState URI) with If-Match header
+	// 3. Reset the system to apply the changes
+
+	// Construct the FutureState URI
+	futureStateURI := system.ODataID + "/SD"
+
+	c.logger.Debug("using AMI FutureState URI for boot settings", zap.String("uri", futureStateURI))
+
+	// First, GET the current FutureState to obtain ETag
+	resp, err := client.Get(futureStateURI)
+	if err != nil {
+		return fmt.Errorf("failed to get current FutureState: %w", err)
+	}
+
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		return fmt.Errorf("no ETag found in FutureState response")
+	}
+
+	c.logger.Debug("obtained ETag from FutureState", zap.String("etag", etag))
+
+	// PATCH to the FutureState URI with If-Match header
+	headers := map[string]string{
+		"If-Match": etag,
+	}
+
+	_, err = client.PatchWithHeaders(futureStateURI, boot, headers)
+	if err != nil {
+		return fmt.Errorf("failed to set boot via AMI FutureState URI: %w", err)
+	}
+
+	c.logger.Debug("successfully set boot settings via AMI FutureState URI")
+
+	// Note that for AMI, the boot override requires a system reset to take effect
+	// We don't need to do anything here, as the reset will be handled by either
+	// the RebootStatusController or the PowerStatusController who called SetPXEBootOnce.
+	return nil
 }
 
 // NewClient returns a new Redfish BMC client.
